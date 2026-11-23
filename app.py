@@ -18,7 +18,7 @@ from labeler import Trybe, process_order
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("order-labels")
 
-SECRET = os.environ["TRYBE_WEBHOOK_SECRET"].encode()
+SECRET = os.environ["TRYBE_WEBHOOK_SECRET"].strip().encode()  # strip stray spaces/newlines from pasting
 ORDER_EVENTS = {"basket.submitted"}
 ITEM_EVENTS = {"basket_item.added", "basket_item.updated"}
 
@@ -58,7 +58,12 @@ def healthz():
 async def trybe_webhooks(request: Request, background: BackgroundTasks):
     raw = await request.body()  # verify against the raw bytes, never re-serialised JSON
     expected = hmac.new(SECRET, raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, request.headers.get("signature", "")):
+    received = request.headers.get("signature", "")
+    if not hmac.compare_digest(expected, received):
+        if not received:
+            log.warning("rejected: no signature header (no secret set on the Trybe webhook config?)")
+        else:
+            log.warning("rejected: signature mismatch (secret in Trybe differs from TRYBE_WEBHOOK_SECRET)")
         return Response(status_code=400)
 
     event = json.loads(raw)

@@ -192,10 +192,12 @@ def process_order(api: Trybe, order_id: str) -> Decision:
 
     if order.get("status") not in LIVE_STATUSES:
         d.skipped = f"order status {order.get('status')}"
+        log.info("order %s skipped: %s", order_id, d.skipped)
         return d
     customer_id = order.get("customer_id")
     if not customer_id:
         d.skipped = "no customer on order"
+        log.info("order %s skipped: %s", order_id, d.skipped)
         return d
 
     d.member = buys_membership(order) or has_membership(api.customer_memberships(customer_id))

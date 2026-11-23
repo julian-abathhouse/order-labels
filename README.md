@@ -8,7 +8,7 @@ membership to.
 | **Member** | Customer has a qualifying membership, or buys one in this order |
 | **Non-member** | Everyone else |
 | **First Timer** (added on top) | No earlier submitted/settled order for this customer |
-| **Order note** `[Membership pitch] ...` | Non-member with a treatment where they paid more than list price x 0.90 |
+| **Order note** `[Membership pitch] ...` | Non-member who would have saved as a member: day pass (Core discount by site and weekday) and treatments (list price x 0.90) |
 
 Orders with no customer attached are skipped.
 
@@ -38,6 +38,8 @@ Orders with no customer attached are skipped.
 | `DRY_RUN` | no | `1` logs decisions without writing to Trybe |
 | `MEMBER_TREATMENT_DISCOUNT` | no | Default `0.10` |
 | `MEMBER_TYPE_EXCLUDE` | no | Regex of membership type names that do not count as Member |
+| `DAY_PASS_DISCOUNT_<SITE>` | no | Core member day-pass discount, Mon..Sun. Plain number = % off, `$` = fixed dollars off. Defaults: NYC sites `30,30,30,30,25,$10,$10`; Philadelphia `35,35,35,35,15,$20,$20`; Berkeley Heights `25,25,25,25,15,$20,$20`. Override per site (`WILLIAMSBURG`, `FLATIRON`, `ATLANTIC_AVE`, `PHILADELPHIA`, `BERKELEY_HEIGHTS`) or all NYC sites at once with `DAY_PASS_DISCOUNT_NYC` |
+| `DAY_PASS_NAME` | no | Regex for session names that count as a day pass, default `day pass` |
 | `SWEEP_HOURS` | no | Lookback for the sweep, default `36` |
 | `SITES` | no | Comma list of sites the sweep covers (`williamsburg,flatiron,atlantic_ave,philadelphia,berkeley_heights`); default all. Must match the sites the labels are enabled for |
 

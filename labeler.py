@@ -6,8 +6,9 @@ Membership status (exactly one):
   Member      customer has a qualifying membership, or buys one in this order
   Non-member  everyone else
 First Timer (added on top): customer has no earlier submitted/settled order.
-Pitch note (Non-member only): for each treatment where the guest paid more
-  than the member price (list price x 0.90), say what they would have saved.
+Pitch note (Non-member only): what the guest would have saved as a member on
+  their day pass (Core discount by site and weekday) and on each treatment
+  (list price x 0.90). Lines with no real saving are left out.
 
 Everything is idempotent: labels are attached with the additive PUT, and the
 note is found by its marker and only rewritten if its text changed.
@@ -19,6 +20,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import date
 
 import httpx
 
@@ -33,6 +35,45 @@ LABEL_MEMBER = os.getenv("LABEL_ID_MEMBER", "")
 LABEL_NON_MEMBER = os.getenv("LABEL_ID_NON_MEMBER", "")
 
 MEMBER_DISCOUNT = float(os.getenv("MEMBER_TREATMENT_DISCOUNT", "0.10"))
+
+# Core member day-pass discount by visit weekday (Mon..Sun), per site.
+# A plain number is % off; a number with $ is a fixed dollar amount off.
+# Override with DAY_PASS_DISCOUNT_<SITE> (or DAY_PASS_DISCOUNT_NYC for the
+# three NYC sites), e.g. DAY_PASS_DISCOUNT_PHILADELPHIA=35,35,35,35,15,$20,$20
+_NYC = "30,30,30,30,25,$10,$10"
+_PHL = "35,35,35,35,15,$20,$20"
+_BH = "25,25,25,25,15,$20,$20"
+_DAY_PASS_SITES = {  # name: (site id, group env var, default)
+    "WILLIAMSBURG": ("9b5df191-5a02-4514-b7e9-2ec2c36fcd0d", "NYC", _NYC),
+    "FLATIRON": ("9b5df0be-b4b1-4e51-8606-79dd25a37f25", "NYC", _NYC),
+    "ATLANTIC_AVE": ("a0e5c9e1-6837-4742-98d2-bd763ab26d86", "NYC", _NYC),
+    "PHILADELPHIA": ("a1f9a972-0c39-42b7-ad41-bd98ee26c1cd", "", _PHL),
+    "BERKELEY_HEIGHTS": ("a25e6ffb-fd9d-4700-a0e3-92e8fc215607", "", _BH),
+}
+
+
+def _parse_discounts(raw: str) -> list[tuple[str, float]]:
+    """'25,15,$20' -> [('pct', 25.0), ('pct', 15.0), ('usd', 20.0)]"""
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            out.append(("usd" if "$" in part else "pct", float(part.replace("$", "").replace("%", ""))))
+    return out
+
+
+DAY_PASS_DISCOUNTS: dict[str, list[tuple[str, float]]] = {}
+for _name, (_site_id, _group, _default) in _DAY_PASS_SITES.items():
+    _raw = os.getenv(f"DAY_PASS_DISCOUNT_{_name}") or (
+        os.getenv(f"DAY_PASS_DISCOUNT_{_group}") if _group else None
+    ) or _default
+    _vals = _parse_discounts(_raw)
+    if len(_vals) == 7:
+        DAY_PASS_DISCOUNTS[_site_id] = _vals
+    else:
+        log.warning("day-pass discount for %s needs 7 values, got %r: ignored", _name, _raw)
+# Which sessions count as a day pass (matched against the item name).
+DAY_PASS_NAME = re.compile(os.getenv("DAY_PASS_NAME", r"day pass"), re.IGNORECASE)
 
 # Trybe "memberships" that should NOT count as Member (packs, partner
 # programs, staff, tests). Matched against the membership type name.
@@ -143,26 +184,71 @@ def _usd(cents: int) -> str:
     return f"${cents / 100:,.2f}".replace(".00", "")
 
 
+def _paid(item: dict) -> int:
+    return (
+        int(item.get("price") or 0)
+        - int(item.get("discount_amount") or 0)
+        - int(item.get("order_discount_amount") or 0)
+    )
+
+
+def _is_day_pass(item: dict) -> bool:
+    return item.get("item_type") == "session" and bool(DAY_PASS_NAME.search(item.get("type_name") or ""))
+
+
+def _day_pass_member_price(order: dict, item: dict) -> int | None:
+    """Core member price (cents) for this day pass, or None if no rule applies."""
+    by_day = DAY_PASS_DISCOUNTS.get(order.get("site_id") or "")
+    try:
+        weekday = date.fromisoformat((item.get("date") or "")[:10]).weekday()  # Mon=0
+    except ValueError:
+        return None
+    if not by_day:
+        return None
+    kind, value = by_day[weekday]
+    price = int(item.get("price") or 0)
+    if kind == "usd":
+        return max(price - round(value * 100), 0)
+    return round(price * (1 - value / 100))
+
+
 def pitch_note(order: dict) -> str | None:
     """Text of the note, or None when there is no real saving to quote.
 
-    Treatments live in package_items. All amounts are cents, pre-tax:
-      price            list price
-      discount_amount  item-level discounts already applied
+    All amounts are cents, pre-tax: price = list price, discount_amount =
+    item-level discounts already applied.
+      Treatments  package_items (NYC) and booking_items of type "appointment"
+                  (Philadelphia): member price = list x (1 - 10%).
+      Day pass    booking_items of type "session" named like a day pass:
+                  Core member price by site and weekday. Only one pass is
+                  quoted (the dearest), since the discount is the member's own.
     """
     lines, total = [], 0
-    for item in order.get("package_items") or []:
-        if item.get("status") == "cancelled":
-            continue
-        price = int(item.get("price") or 0)
-        paid = price - int(item.get("discount_amount") or 0) - int(item.get("order_discount_amount") or 0)
+    bookings = [b for b in order.get("booking_items") or [] if b.get("status") != "cancelled"]
+
+    passes = [b for b in bookings if _is_day_pass(b) and _day_pass_member_price(order, b) is not None]
+    if passes:
+        item = max(passes, key=lambda b: int(b.get("price") or 0))
+        paid, member_price = _paid(item), _day_pass_member_price(order, item)
+        if paid - member_price > 0:
+            total += paid - member_price
+            lines.append(
+                f"Day Pass: {_usd(member_price)} as a Core member "
+                f"(paid {_usd(paid)}, saves {_usd(paid - member_price)})"
+            )
+
+    treatments = [p for p in order.get("package_items") or [] if p.get("status") != "cancelled"]
+    treatments += [b for b in bookings if b.get("item_type") == "appointment"]
+    for item in treatments:
+        price, paid = int(item.get("price") or 0), _paid(item)
         member_price = round(price * (1 - MEMBER_DISCOUNT))
         saving = paid - member_price
         if saving <= 0:
             continue
         total += saving
+        name = re.sub(r"\s*\(.*?\)", "", item.get("type_name") or "Treatment").strip()
         lines.append(
-            f"{item.get('type_name', 'Treatment')}: {_usd(member_price)} with a membership "
+            f"{name}: {_usd(member_price)} with a membership "
             f"(paid {_usd(paid)}, saves {_usd(saving)})"
         )
     if not lines:
